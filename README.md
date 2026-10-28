@@ -1,3 +1,8 @@
+
+<a>
+  <img src="https://i.postimg.cc/Vkkm2r75/IMG-2489.jpg" width="300">
+</a>
+
 # Cunnit
 
 Cunnit is a Debian Linux based operating system designed to function as a server.
