@@ -1,0 +1,37 @@
+# Base live system
+live-boot
+live-config
+live-config-systemd
+# live-config only recommends this, but needs it to create the cunnit user
+user-setup
+systemd-sysv
+systemd-resolved
+kmod
+sudo
+
+# Shell & everyday CLI tools
+bash-completion
+nano
+less
+procps
+iproute2
+iputils-ping
+net-tools
+openssh-client
+ca-certificates
+curl
+
+# Containers
+docker.io
+docker-compose
+iptables
+
+# Server
+openssh-server
+nftables
+unattended-upgrades
+open-vm-tools
+
+# Wi-Fi (EnableWiFi / StopWiFi)
+iwd
+rfkill

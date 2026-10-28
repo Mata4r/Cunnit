@@ -1,0 +1,11 @@
+#!/bin/sh
+# Live mode only: live-config gives "cunnit" the password "live" and
+# password-less sudo. Make tdo ask for the password, and force a new
+# password at the first login (console or SSH).
+for f in /etc/sudoers.d/*; do
+  [ -f "$f" ] && grep -q NOPASSWD "$f" && rm -f "$f"
+done
+if id cunnit >/dev/null 2>&1; then
+  chage -d 0 cunnit
+fi
+exit 0

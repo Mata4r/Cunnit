@@ -1,0 +1,13 @@
+[Unit]
+Description=Cunnit live-mode login hardening
+ConditionPathIsDirectory=/run/live/medium
+After=live-config.service
+Before=systemd-user-sessions.service getty@tty1.service ssh.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/cunnit-live-secure
+
+[Install]
+WantedBy=multi-user.target

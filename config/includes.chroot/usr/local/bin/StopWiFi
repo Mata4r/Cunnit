@@ -1,0 +1,11 @@
+#!/bin/sh
+# StopWiFi    disconnect, stop iwd and switch the Wi-Fi radio off.
+# Wired networking is not affected. EnableWiFi turns it back on.
+[ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"
+
+for d in /sys/class/net/*; do
+  [ -d "$d/wireless" ] && iwctl station "${d##*/}" disconnect 2>/dev/null
+done
+systemctl disable --now iwd.service >/dev/null 2>&1
+rfkill block wifi 2>/dev/null
+echo "Wi-Fi is off."

@@ -1,0 +1,49 @@
+#!/bin/sh
+# EnableWiFi               turn Wi-Fi on and list nearby networks
+# EnableWiFi "Network"     turn Wi-Fi on and connect (asks for the password)
+# Wi-Fi stays on across reboots on an installed system until StopWiFi.
+set -e
+[ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"
+
+wifi_dev() {
+  for d in /sys/class/net/*; do
+    [ -d "$d/wireless" ] && { echo "${d##*/}"; return; }
+  done
+}
+
+rfkill unblock wifi 2>/dev/null || true
+systemctl enable --now iwd.service >/dev/null 2>&1
+
+# iwd needs a moment to take over the card.
+DEV=""
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  DEV=$(wifi_dev)
+  [ -n "$DEV" ] && break
+  sleep 1
+done
+if [ -z "$DEV" ]; then
+  echo "No Wi-Fi card found. Check 'ip link' and 'rfkill list'." >&2
+  exit 1
+fi
+
+iwctl device "$DEV" set-property Powered on 2>/dev/null || true
+iwctl station "$DEV" scan 2>/dev/null || true
+sleep 3
+
+if [ -z "$1" ]; then
+  iwctl station "$DEV" get-networks
+  echo "Wi-Fi is on ($DEV). Connect with: EnableWiFi \"Network name\""
+  exit 0
+fi
+
+iwctl station "$DEV" connect "$1"
+
+printf 'Getting an IP address'
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+  IP=$(ip -4 -o addr show dev "$DEV" | awk '{ print $4; exit }')
+  [ -n "$IP" ] && { printf '\nConnected to "%s" on %s, IP %s\n' "$1" "$DEV" "$IP"; exit 0; }
+  printf '.'
+  sleep 1
+done
+printf '\nConnected to "%s", but no IP address yet. Check: networkctl status %s\n' "$1" "$DEV"
+exit 1

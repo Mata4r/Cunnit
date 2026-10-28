@@ -1,0 +1,13 @@
+[Unit]
+Description=tmpfs for /var/lib/rancher on the live system
+ConditionPathIsDirectory=/run/live/medium
+Before=local-fs.target containerd.service docker.service k3s.service
+
+[Mount]
+What=tmpfs
+Where=/var/lib/rancher
+Type=tmpfs
+Options=mode=0711
+
+[Install]
+WantedBy=local-fs.target

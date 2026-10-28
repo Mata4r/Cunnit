@@ -1,0 +1,2 @@
+# Let the unprivileged user run kubectl once k3s is up.
+write-kubeconfig-mode: "0644"

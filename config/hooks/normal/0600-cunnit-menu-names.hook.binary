@@ -1,0 +1,7 @@
+#!/bin/sh
+# Runs in binary/ after live-build has written the boot menus.
+# live-build hard-codes "Live system" in the generated GRUB entries.
+set -e
+for f in boot/grub/grub.cfg isolinux/*.cfg; do
+  [ -f "$f" ] && sed -i 's/Live system/Cunnit Live/g' "$f"
+done

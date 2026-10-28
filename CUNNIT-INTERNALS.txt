@@ -1,0 +1,397 @@
+CUNNIT INTERNALS: KERNEL AND PROCESSES
+======================================
+2026-10-28
+
+
+1. OVERVIEW
+-----------
+Cunnit is a stock Debian 13 (trixie) Linux kernel running a small systemd
+userland that boots from a read-only image into RAM. Nothing about the
+kernel is custom: Cunnit's identity comes from the boot menu, the services
+it enables, and what runs at login.
+
+Five layers run in order, each handing off to the next:
+
+  1. Firmware (BIOS or UEFI) loads the boot menu from the ISO or USB stick.
+  2. Bootloader: ISOLINUX on BIOS, GRUB on UEFI. Both show the green Cunnit
+     menu and load the kernel plus initramfs.
+  3. Kernel + initramfs: the kernel starts, and live-boot inside the
+     initramfs builds the root filesystem.
+  4. systemd (PID 1): starts networking, the firewall, SSH, Docker and the
+     tmpfs mounts, then a login prompt on tty1.
+  5. Login shell: live-config has created the user "cunnit". After you log
+     in (console or SSH) and set a new password, bash prints the green logo
+     and bar, then the prompt.
+
+This describes live mode (booted from the ISO or USB). If Cunnit is
+installed to disk with the "Install" boot entry, steps 3 and 5 differ: the
+kernel mounts the disk as root directly, and the user and password are the
+ones chosen in the installer.
+
+Docker containers and Kubernetes pods are not a separate layer. They are
+ordinary Linux processes that the kernel isolates with namespaces and
+limits with cgroups.
+
+
+2. BOOT SEQUENCE
+----------------
+From power-on to prompt, Cunnit never writes to the boot medium: the whole
+OS lives in one compressed file, and every change goes to RAM.
+
+  1. Firmware picks a bootloader. BIOS machines run isolinux/isolinux.bin.
+     UEFI machines run GRUB from the ISO's EFI partition.
+  2. The Cunnit menu appears. ISOLINUX loads vesamenu.c32 with the 640x480
+     Cunnit splash. GRUB loads the theme in /boot/grub/live-theme/theme.txt
+     with the 1024x768 splash. After 5 seconds the default entry,
+     "Cunnit Live", boots.
+  3. The bootloader loads two files into memory: the kernel
+     (/live/vmlinuz) and the initramfs (/live/initrd.img), and passes the
+     kernel command line (see section 3).
+  4. The kernel unpacks the initramfs into a temporary root in RAM and runs
+     its /init script.
+  5. live-boot builds the real root filesystem:
+       - finds the boot medium (CD, USB or disk) and mounts it at
+         /run/live/medium
+       - mounts /live/filesystem.squashfs read-only. This is the complete
+         Cunnit system, compressed.
+       - creates a tmpfs (RAM) as the writable layer
+       - stacks the two with overlayfs: reads come from the squashfs,
+         writes go to RAM
+  6. switch_root makes that overlay the new / and runs /sbin/init, which is
+     systemd. It becomes PID 1.
+
+The overlay is why Cunnit resets on every reboot: the RAM layer is gone
+when the power goes off. Adding "persistence" to the kernel command line,
+with a USB partition labelled "persistence", would keep changes.
+
+
+3. THE KERNEL
+-------------
+Cunnit runs Debian's unmodified linux-image-amd64 kernel (the 6.12 LTS
+series in trixie), so security updates and hardware support come straight
+from Debian. What makes it Cunnit is the command line it is booted with and
+the kernel features its services rely on.
+
+Kernel command line
+  Set in build.sh (--bootappend-live), visible at runtime in /proc/cmdline.
+
+  boot=live          read by initramfs    hands root-filesystem setup to live-boot
+  components         read by live-config  runs all live-config setup scripts
+  hostname=cunnit    read by live-config  sets the machine name
+  username=cunnit    read by live-config  name of the auto-created user
+  noautologin        read by live-config  no automatic login on the consoles
+  quiet              read by kernel       hides most boot messages
+  loglevel=3         read by kernel       shows only errors and worse
+
+Kernel features Cunnit depends on
+
+  squashfs
+      Reads the compressed system image. Used by live-boot.
+  overlayfs (overlay module)
+      Stacks a writable layer over a read-only one. Used for the live root
+      and for container image layers.
+  tmpfs
+      Filesystem stored in RAM. Used for the writable root layer and for
+      /var/lib/docker, /var/lib/containerd, /var/lib/rancher.
+  Namespaces (pid, net, mnt, uts, ipc, user, cgroup)
+      Give a process its own view of the system. Used by Docker,
+      containerd, k3s.
+  cgroups v2
+      Limit and account CPU, memory and process counts per group. Used by
+      systemd, Docker, k3s.
+  netfilter / nftables (br_netfilter module)
+      Packet filtering and NAT, including across bridges. Used by Docker
+      networking and k3s service routing.
+  veth and bridge devices
+      Virtual network cables and switches. Used for container and pod
+      networking.
+
+Modules load on demand. The k3s service also loads br_netfilter and overlay
+explicitly before it starts (ExecStartPre in k3s.service).
+
+
+4. PID 1 AND SYSTEMD
+--------------------
+systemd is the first user-space process (PID 1), and every other process on
+Cunnit is its child or grandchild. If PID 1 dies, the kernel panics, so
+systemd's job is to start, supervise and restart everything else.
+
+Process tree after boot
+
+  systemd (PID 1)
+  +-- systemd-journald        system log
+  +-- systemd-udevd           hardware and device events
+  +-- systemd-networkd        DHCP on wired NICs
+  +-- systemd-resolved        DNS
+  +-- sshd                    SSH server
+  |   +-- sshd (per session)
+  |       +-- bash            a remote login
+  +-- containerd              container runtime
+  |   +-- containerd-shim     one per running container
+  |       +-- <container processes>
+  +-- dockerd                 Docker API (talks to containerd)
+  +-- k3s server              only after: tdo systemctl start k3s
+  |   +-- embedded containerd
+  |   +-- containerd-shim
+  |       +-- <pod processes>
+  +-- agetty / login (tty1)   console login prompt
+      +-- bash
+          +-- <your commands>
+
+Units Cunnit enables
+  Cunnit boots to multi-user.target (text mode, no graphical desktop).
+
+  systemd-networkd.service      at boot
+      DHCP on every en* / eth* interface
+      (/etc/systemd/network/20-wired.network) and every Wi-Fi wl*
+      interface (25-wireless.network)
+  iwd.service                   on demand
+      Wi-Fi: scans, joins networks, handles WPA. Started by EnableWiFi
+      (which also enables it at boot) and stopped by StopWiFi. iwd only
+      joins the network; systemd-networkd then gets the IP by DHCP.
+  systemd-resolved.service      at boot
+      DNS. A tmpfiles rule links /etc/resolv.conf to its stub resolver.
+  var-lib-docker.mount, var-lib-containerd.mount, var-lib-rancher.mount
+                                at boot, live system only
+      Put container storage on tmpfs, because Docker's overlay2 driver
+      cannot stack on the overlayfs root. Skipped on an installed system
+      (ConditionPathIsDirectory=/run/live/medium).
+  containerd.service            at boot
+      Runs containers for Docker.
+  docker.service                at boot
+      The Docker daemon that the docker command talks to.
+  k3s.service                   on demand
+      Kubernetes. Disabled by default to save RAM.
+  nftables.service              at boot
+      Host firewall from /etc/nftables.conf. Drops incoming traffic except
+      SSH (22), web (80, 443), Kubernetes API (6443), NodePorts
+      (30000-32767) and traffic from containers and pods. It uses its own
+      table (inet cunnit), so Docker's and k3s's rules are untouched.
+  ssh.service                   at boot
+      SSH server. A drop-in runs "ssh-keygen -A" first, so each machine
+      creates its own host keys (none are shipped in the ISO).
+  cunnit-live-secure.service    at boot, live system only
+      Runs after live-config: removes password-less sudo and forces a new
+      password at first login.
+  apt-daily timers              daily
+      Download and install security updates (unattended-upgrades).
+  getty@tty1.service            at boot
+      Console login prompt. The screen above it shows the IP address.
+
+How systemd controls processes
+  - Each service runs in its own cgroup under /sys/fs/cgroup/system.slice/.
+    systemd can stop all of a service's processes at once and limit its CPU
+    and memory.
+  - Restart=always in k3s.service makes systemd restart k3s 5 seconds after
+    any crash.
+  - Delegate=yes lets k3s create and manage its own cgroups for pods.
+  - KillMode=process means stopping k3s stops only the k3s process, so
+    running pods are not killed with it.
+
+
+5. LOGIN AND THE SHELL
+----------------------
+In live mode the user "cunnit" doesn't exist in the image. live-config
+creates it at every boot with the password "live", and Cunnit forces you to
+replace that password the first time you log in.
+
+From boot to prompt
+  1. live-config runs early in boot. It reads
+     /etc/live/config.conf.d/cunnit.conf and the kernel command line, sets
+     the hostname to cunnit, and creates the user cunnit (password "live")
+     from /etc/skel. The user is added to the groups sudo, docker, audio,
+     video, netdev and others. live-config also writes
+     /etc/sudoers.d/live, which allows password-less sudo.
+  2. cunnit-live-secure.service runs next. It deletes that password-less
+     sudo rule and runs "chage -d 0 cunnit", which marks the password as
+     expired.
+  3. systemd starts getty@tty1 and sshd. Because of "noautologin" on the
+     kernel command line, live-config does not set up autologin, so agetty
+     shows /etc/issue (Cunnit, the tty and the IP address) and a login
+     prompt.
+  4. You log in on the console (agetty -> login) or over SSH (sshd). PAM
+     sees the expired password and asks for the current one ("live"), then
+     a new one. The session then ends, and you log in again with the new
+     password.
+  5. login (or sshd) starts bash as a login shell. Bash reads /etc/profile,
+     which runs every script in /etc/profile.d/.
+  6. /etc/profile.d/zz-cunnit-banner.sh runs. It clears the screen, prints
+     the logo in light green (ANSI code 1;92), then a full-width bar of
+     light-green background (102). It runs only in an interactive terminal,
+     and only once per session.
+  7. Bash reads ~/.bashrc. The build added a green cunnit@cunnit:~$ prompt
+     to it.
+  8. The prompt appears. Each command you type is a new child process of
+     bash: bash calls fork() to copy itself, then exec() to replace the copy
+     with the program.
+
+Privileges: tdo
+  tdo is Cunnit's admin command. It is a symlink,
+  /usr/local/bin/tdo -> /usr/bin/sudo, so it behaves exactly like sudo:
+
+  - sudo is a setuid-root program. When any user runs it, the kernel starts
+    it with root's user ID.
+  - It checks /etc/sudoers and /etc/sudoers.d/. Members of the sudo group
+    (which includes cunnit) may run anything as root after typing their
+    own password. sudo remembers it for 15 minutes per terminal.
+  - /etc/sudoers.d/tdo changes the password prompt to
+    "[tdo] password for ...".
+  - If allowed, it runs your command as a root-owned child process.
+
+  The real sudo stays installed underneath, because Debian packages and
+  system scripts call it by name.
+
+  Membership of the docker group gives similar power: the Docker socket
+  (/var/run/docker.sock) is owned by that group, and dockerd runs as root.
+  Treat docker group membership as root access.
+
+
+6. CONTAINERS (DOCKER)
+----------------------
+A container is not a virtual machine. It is a normal process on the Cunnit
+kernel, given its own private view of the system by namespaces and capped
+by cgroups. There is only one kernel, shared by the host and every
+container.
+
+What happens on "docker run nginx"
+  1. The docker command sends the request to dockerd over
+     /var/run/docker.sock.
+  2. dockerd pulls the image if needed and unpacks its layers into
+     /var/lib/docker (a tmpfs on the live system).
+  3. dockerd asks containerd to create the container.
+  4. containerd starts a containerd-shim, which runs runc.
+  5. runc makes the kernel calls that build the container:
+       - clone() / unshare() with new namespaces, so the process gets its
+         own PIDs, network, mounts and hostname
+       - writes limits into a new cgroup under /sys/fs/cgroup/
+       - mounts the image layers with overlayfs as the container's /, then
+         pivot_root into it
+       - drops Linux capabilities and applies a seccomp filter to block
+         dangerous system calls
+       - exec() of the container's main program, which becomes PID 1
+         inside the container
+  6. runc exits. The shim stays as the container's parent, holding its
+     input/output and exit code, so dockerd can restart without killing
+     containers.
+
+Namespaces a container gets
+  pid      only its own processes; its main program is PID 1
+  net      its own network interface (one end of a veth pair joined to the
+           docker0 bridge) and IP address
+  mnt      its own filesystem tree built from the image
+  uts      its own hostname
+  ipc      its own shared memory and message queues
+  cgroup   only its own branch of the cgroup tree
+
+Seen from the host
+  Container processes appear in the host's ps like any other process, with
+  host PIDs, under containerd-shim. A process that is PID 1 in a container
+  might be PID 2731 on the host. Inside the container, ps shows only the
+  container's own processes.
+
+Networking
+  Each container gets a veth pair: one end inside its network namespace as
+  eth0, the other on the host's docker0 bridge. Docker adds nftables rules
+  (through iptables) to NAT outbound traffic and to forward published ports
+  (-p 8080:80) to the container.
+
+
+7. KUBERNETES (K3S)
+-------------------
+k3s packs all of Kubernetes into one binary, /usr/local/bin/k3s, and runs
+the whole control plane as a single process. On Cunnit it stays off until
+you run "tdo systemctl start k3s", so it uses no RAM until you need it.
+
+What the single "k3s server" process contains
+  API server            receives every kubectl request; the front door of
+                        the cluster
+  Datastore             SQLite through kine; stores the cluster state in
+                        /var/lib/rancher/k3s/server/db
+  Scheduler             picks a node for each new pod (always this machine
+                        on Cunnit)
+  Controller manager    keeps actual state matching what you asked for,
+                        e.g. restarts crashed pods
+  kubelet               asks containerd to start and stop the pods assigned
+                        to this node
+  kube-proxy            writes nftables rules so a Service's IP reaches its
+                        pods
+  Flannel (network)     gives each pod an IP and connects pods through the
+                        cni0 bridge
+
+What happens on "tdo systemctl start k3s"
+  1. systemd loads the overlay and br_netfilter kernel modules
+     (ExecStartPre).
+  2. systemd starts "k3s server". It reads /etc/rancher/k3s/config.yaml,
+     which makes the kubeconfig readable by every user
+     (write-kubeconfig-mode: "0644").
+  3. k3s starts its own embedded containerd, with its socket at
+     /run/k3s/containerd/containerd.sock. This is separate from Docker's
+     containerd.
+  4. k3s writes /etc/rancher/k3s/k3s.yaml, the kubeconfig that kubectl uses.
+  5. k3s tells systemd it is ready (Type=notify), then deploys its built-in
+     add-ons as pods: CoreDNS, the Traefik ingress, metrics-server and the
+     local-path storage provisioner.
+
+Pods are processes too
+  A pod is one or more containers sharing a network namespace. kubelet asks
+  k3s's containerd to create them, and containerd uses a shim and runc
+  exactly as in section 6. Pod processes show up in the host's ps under
+  containerd-shim, and their cgroups live under a kubepods branch of
+  /sys/fs/cgroup/.
+
+  Because k3s uses its own containerd, "docker ps" doesn't show pods. Use
+  "kubectl get pods -A", or "tdo crictl ps" to see them at the container
+  level.
+
+kubectl
+  kubectl and crictl are symlinks to the k3s binary. k3s checks the name it
+  was called by and acts as that tool. kubectl reads
+  /etc/rancher/k3s/k3s.yaml and sends HTTPS requests to the API server on
+  port 6443.
+
+  On the live system, /var/lib/rancher is a tmpfs, so the cluster and
+  everything in it is gone after a reboot.
+
+
+8. INSPECTING IT YOURSELF
+-------------------------
+Everything in this document can be checked on a running Cunnit with these
+commands. Commands starting with tdo need root.
+
+Kernel
+  uname -r                    kernel version
+  cat /proc/cmdline           the command line Cunnit booted with
+  lsmod                       loaded kernel modules (look for overlay,
+                              br_netfilter, squashfs)
+  tdo dmesg                   kernel messages since boot
+  findmnt /                   the overlayfs root and its layers
+  findmnt -t tmpfs            every RAM filesystem, including the container
+                              storage mounts
+
+Processes
+  ps -ef --forest             every process as a tree under systemd
+  ps -o pid,ppid,user,cmd -p $$
+                              your shell's PID, its parent and its user
+  top                         live CPU and memory use per process
+  cat /proc/<pid>/status      everything the kernel tracks about one process
+  ls -l /proc/<pid>/ns        which namespaces a process is in
+
+systemd and cgroups
+  systemctl status            overall state and the unit tree
+  systemctl list-units --type=service
+                              every running service
+  systemd-cgls                the cgroup tree with the processes in each group
+  systemd-cgtop               live CPU and memory use per cgroup
+  journalctl -b               all logs since boot
+  journalctl -u k3s -f        live log of one service (here k3s)
+
+Containers and Kubernetes
+  docker ps                   running Docker containers
+  docker inspect -f '{{.State.Pid}}' <name>
+                              a container's host PID
+  tdo nsenter -t <pid> -n ip addr
+                              the network inside a container, entered from
+                              the host
+  kubectl get pods -A         every pod in the k3s cluster
+  tdo crictl ps               pod containers as k3s's containerd sees them
+  kubectl top pods -A         CPU and memory per pod (from metrics-server)

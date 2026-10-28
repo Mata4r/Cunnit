@@ -1,0 +1,52 @@
+#!/bin/sh
+# Runs inside the image chroot at build time.
+set -e
+
+# Networking: DHCP on every wired NIC via systemd-networkd + resolved.
+# Debian's base system adds ifupdown, which would compete with networkd.
+apt-get purge -y ifupdown
+systemctl enable systemd-networkd.service systemd-resolved.service
+
+# Docker starts at boot; k3s is installed but only started on demand.
+systemctl enable containerd.service docker.service
+systemctl enable var-lib-docker.mount var-lib-containerd.mount var-lib-rancher.mount
+
+# Server: SSH, host firewall, live-mode login hardening.
+# Host keys made here would be shared by every machine booted from this ISO,
+# so drop them; ssh.service regenerates them on first start.
+rm -f /etc/ssh/ssh_host_*
+chmod 0755 /usr/local/sbin/cunnit-live-secure
+systemctl enable ssh.service nftables.service cunnit-live-secure.service
+
+# Kubernetes: latest stable k3s single binary, checksum-verified.
+K3S_TAG=$(curl -fsSL -o /dev/null -w '%{url_effective}' https://update.k3s.io/v1-release/channels/stable | sed 's#.*/##')
+K3S_URL="https://github.com/k3s-io/k3s/releases/download/$(echo "$K3S_TAG" | sed 's/+/%2B/g')"
+cd /tmp
+curl -fsSLo k3s "$K3S_URL/k3s"
+curl -fsSLo k3s.sha256 "$K3S_URL/sha256sum-amd64.txt"
+grep ' k3s$' k3s.sha256 | sha256sum -c -
+install -m 0755 k3s /usr/local/bin/k3s
+ln -sf k3s /usr/local/bin/kubectl
+ln -sf k3s /usr/local/bin/crictl
+rm -f k3s k3s.sha256
+echo "Installed k3s $K3S_TAG"
+
+# Light-green prompt for the live user (created from /etc/skel at boot).
+cat >> /etc/skel/.bashrc <<'RC'
+
+# Cunnit prompt
+PS1='\[\e[1;92m\]\u@cunnit\[\e[0m\]:\[\e[1;37m\]\w\[\e[0m\]\$ '
+RC
+
+# Branding (ID stays "debian" so apt and tooling keep working).
+sed -i 's/^PRETTY_NAME=.*/PRETTY_NAME="Cunnit (Debian based)"/' /usr/lib/os-release
+: > /etc/motd
+
+# "tdo" is Cunnit's admin command (sudo stays underneath for scripts/packages).
+ln -sf /usr/bin/sudo /usr/local/bin/tdo
+printf 'Defaults passprompt="[tdo] password for %%p: "\n' > /etc/sudoers.d/tdo
+chmod 0440 /etc/sudoers.d/tdo
+visudo -cf /etc/sudoers.d/tdo
+cat >> /etc/skel/.bashrc <<'RC'
+complete -F _comp_command tdo 2>/dev/null || complete -F _command tdo 2>/dev/null || complete -c tdo
+RC
